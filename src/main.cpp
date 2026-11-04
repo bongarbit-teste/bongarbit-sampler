@@ -16,6 +16,11 @@
  * itself is held (press feedback), overriding the page pattern, then the
  * pattern resumes on release.
  *
+ * Each button has a piezo (GPIO 7/2/1 for buttons 1/2/3). The sample's
+ * volume follows how hard the piezo is hit: after a press, the peak ADC
+ * reading over PIEZO_WINDOW_MS (5 ms) is mapped to dB (see the piezo section
+ * below), then the sample starts at that level.
+ *
  * Hardware: ESP32-S3 N16R8 + PCM5102A (I2S) + microSD (SPI, optional - see
  * USE_SD_SAMPLER below). Full wiring plan: docs/circuit.md
  *
@@ -88,6 +93,46 @@ const uint8_t   buttonPins[BUTTON_COUNT]  = {6, 5, 4};
 Bounce          buttonBounce[BUTTON_COUNT];
 Samp            buttonSamp[BUTTON_COUNT];
 uint8_t         buttonChannels[BUTTON_COUNT] = {1, 1, 1};
+
+// --- Piezo -> sample volume ---
+// Pressing button i opens a PIEZO_WINDOW_MS window during which piezo i's ADC
+// is sampled every loop; when it closes, the peak reading in that window sets
+// the sample's volume in dB and the sample starts. So playback begins
+// PIEZO_WINDOW_MS after the press, not instantly. All piezo pins are ADC1.
+//
+// Mapping (peak above PIEZO_BASELINE -> dB): logarithmic between the two
+// anchors, clamped outside them:
+//   peak <= PIEZO_PEAK_MIN -> VOL_MIN_DB (softest; a press with no hit)
+//   peak >= piezoPeakMax[i] -> VOL_MAX_DB (loudest, 0 dB = sample at full level)
+// Tune PIEZO_PEAK_MIN and piezoPeakMax[] to your piezos (a firm hit, below the
+// 4095 ADC ceiling). PIEZO_BASELINE is 0 for a piezo wired straight to the
+// pin; with the mid-rail bias circuit use 2048 (the peak is then |v - 2048|).
+#define PIEZO_WINDOW_MS  5
+#define PIEZO_BASELINE   0
+#define PIEZO_PEAK_MIN   40
+// Per-piezo ceiling (peak that maps to VOL_MAX_DB): piezos differ in sensitivity,
+// so each has its own. Piezos 1 and 3 use the ADC max (4095); piezo 2 hits 0 dB at 2026.
+#define VOL_MIN_DB       (-30.0f)
+#define VOL_MAX_DB       0.0f
+const uint8_t     piezoPins[BUTTON_COUNT]        = {7, 2, 1}; // P1, P2, P3
+const uint16_t    piezoPeakMax[BUTTON_COUNT]     = {4095, 2026, 4095}; // peak -> 0 dB, per piezo
+bool              piezoSampling[BUTTON_COUNT]    = {false, false, false};
+uint32_t          piezoStartUs[BUTTON_COUNT]     = {0, 0, 0};
+uint16_t          piezoPeak[BUTTON_COUNT]        = {0, 0, 0};
+volatile uint16_t buttonGainQ15[BUTTON_COUNT]    = {32768, 32768, 32768}; // 32768 = 1.0 (0 dB); read in audioUpdate()
+
+float peakToDb(uint16_t peak, uint16_t peakMax) {
+  if (peak <= PIEZO_PEAK_MIN) return VOL_MIN_DB;
+  if (peak >= peakMax) return VOL_MAX_DB;
+  float t = logf((float)peak / PIEZO_PEAK_MIN) / logf((float)peakMax / PIEZO_PEAK_MIN);
+  return VOL_MIN_DB + t * (VOL_MAX_DB - VOL_MIN_DB);
+}
+
+uint16_t dbToGainQ15(float db) {
+  float g = powf(10.0f, db / 20.0f); // dB -> linear amplitude
+  if (g > 1.0f) g = 1.0f;            // never boost above the sample's own level (would clip)
+  return (uint16_t)(g * 32768.0f);
+}
 
 // --- Pages (see docs/circuit.md) ---
 // Only one page's worth of samples (3 files) lives in RAM at a time -
@@ -220,19 +265,33 @@ void setup() {
 void loop() {
   for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
     buttonBounce[i].update();
+    if (piezoSampling[i]) {
+      int16_t dev = (int16_t)analogRead(piezoPins[i]) - PIEZO_BASELINE;
+      uint16_t v = dev < 0 ? -dev : dev;
+      if (v > piezoPeak[i]) piezoPeak[i] = v;
+      if (micros() - piezoStartUs[i] >= PIEZO_WINDOW_MS * 1000UL) {
+        piezoSampling[i] = false;
+        float db = peakToDb(piezoPeak[i], piezoPeakMax[i]);
+        buttonGainQ15[i] = dbToGainQ15(db);
+        DBG("Button %u: piezo peak %u in %u ms -> %.1f dB\n", i + 1, piezoPeak[i], PIEZO_WINDOW_MS, db);
+        buttonSamp[i].start();
+      }
+    }
     if (buttonBounce[i].fell()) { // debounced press edge (HIGH -> LOW), fires once per press
 #if USE_SD_SAMPLER
-      if (buttonLoaded[i]) {
-        DBG("Button %u: pressed (GPIO%d, page %u)\n", i + 1, buttonPins[i], page + 1);
-        buttonSamp[i].start();
-      } else {
+      if (!buttonLoaded[i]) {
         DBG("Button %u: pressed (GPIO%d, page %u) - no sample loaded for this slot\n",
             i + 1, buttonPins[i], page + 1);
+        continue;
       }
+      DBG("Button %u: pressed (GPIO%d, page %u)\n", i + 1, buttonPins[i], page + 1);
 #else
       DBG("Button %u: pressed (GPIO%d)\n", i + 1, buttonPins[i]);
-      buttonSamp[i].start();
 #endif
+      // Open the piezo window; the sample starts when it closes (above).
+      piezoPeak[i]     = 0;
+      piezoStartUs[i]  = micros();
+      piezoSampling[i] = true;
     }
   }
 
@@ -282,8 +341,9 @@ void audioUpdate() {
     } else {
       l = r = buttonSamp[i].next(); // nextStereo() only works for stereo buffers (num_channels==2)
     }
-    mixL += l;
-    mixR += r;
+    uint32_t gain = buttonGainQ15[i]; // piezo-derived volume, Q15
+    mixL += ((int32_t)l * (int32_t)gain) >> 15;
+    mixR += ((int32_t)r * (int32_t)gain) >> 15;
   }
 
   int16_t outL = (int16_t)max((int32_t)MIN_16, min((int32_t)MAX_16, mixL));
