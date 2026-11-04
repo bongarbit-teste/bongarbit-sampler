@@ -213,17 +213,6 @@ void setup() {
 }
 
 void loop() {
-  // Raw, unfiltered pin state, printed regardless of debounce/edge logic -
-  // lets you watch the 3 GPIOs live while physically pressing each button.
-  static uint32_t lastRawPrint = 0;
-  if (millis() - lastRawPrint > 500) {
-    lastRawPrint = millis();
-    for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
-      DBG("Button raw: GPIO%d = %s\n", buttonPins[i],
-          digitalRead(buttonPins[i]) == LOW ? "LOW" : "HIGH");
-    }
-  }
-
   for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
     buttonBounce[i].update();
     if (buttonBounce[i].fell()) { // debounced press edge (HIGH -> LOW), fires once per press
