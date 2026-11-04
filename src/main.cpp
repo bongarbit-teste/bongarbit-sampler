@@ -84,7 +84,7 @@ SdFs sd;
 // on its fell() edge, so it fires exactly once per press.
 #define BUTTON_COUNT 3
 #define BUTTON_DEBOUNCE_MS 10 // shared by the 3 buttons and the mode button
-const uint8_t   buttonPins[BUTTON_COUNT]  = {4, 5, 6};
+const uint8_t   buttonPins[BUTTON_COUNT]  = {6, 5, 4};
 Bounce          buttonBounce[BUTTON_COUNT];
 Samp            buttonSamp[BUTTON_COUNT];
 uint8_t         buttonChannels[BUTTON_COUNT] = {1, 1, 1};
