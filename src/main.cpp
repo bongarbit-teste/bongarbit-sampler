@@ -156,7 +156,12 @@ void loadPage(uint8_t p) {
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
+  // Native USB CDC: anything printed before the host opens the port is lost,
+  // so wait (up to 3 s) for the monitor - otherwise boot/SD/DAC messages vanish
+  // and the serial looks "dead" until a button is pressed.
+  uint32_t t0 = millis();
+  while (!Serial && millis() - t0 < 3000) delay(10);
+  delay(200);
 
 #if USE_SD_SAMPLER
   // initSD() on the first button also mounts the card and lists the .wav
