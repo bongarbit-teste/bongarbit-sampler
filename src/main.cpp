@@ -21,6 +21,10 @@
  * reading over PIEZO_WINDOW_MS (5 ms) is mapped to dB (see the piezo section
  * below), then the sample starts at that level.
  *
+ * An IR distance sensor (GPIO8) sets the playback speed of all voices in real
+ * time, from 1x (resting, reading >= 3700) up to 2x (bar closest, reading
+ * lowest), on a linear scale - see the sensor section below.
+ *
  * Hardware: ESP32-S3 N16R8 + PCM5102A (I2S) + microSD (SPI, optional - see
  * USE_SD_SAMPLER below). Full wiring plan: docs/circuit.md
  *
@@ -134,6 +138,37 @@ uint16_t dbToGainQ15(float db) {
   return (uint16_t)(g * 32768.0f);
 }
 
+// --- IR distance sensor -> playback speed (all 3 voices) ---
+// The reflective sensor on GPIO8 (ADC1) sets how fast the samples play, live:
+// the lower the reading (bar closer), the faster, up to 2x. Resting readings
+// sit above ~3600, so anything >= SENSOR_THRESHOLD means "no change" (1x).
+// Linear scale (first attempt):
+//   reading >= SENSOR_THRESHOLD (3700) -> 1.0x
+//   reading <= SENSOR_CLOSE     (200)  -> 2.0x   (closest readings seen: ~85-200)
+//   in between                          -> 1.0x + (THRESHOLD - reading)/(THRESHOLD - CLOSE)
+// The reading is smoothed by a sliding mean of the last SENSOR_AVG reads, taken
+// every SENSOR_READ_MS. Samp::setSpeed() takes effect on a voice that is
+// already playing, so the pitch/speed follows the bar in real time.
+#define SENSOR_PIN        8
+#define SENSOR_THRESHOLD  3700
+#define SENSOR_CLOSE      200
+#define SPEED_MIN         1.0f
+#define SPEED_MAX         2.0f
+#define SENSOR_READ_MS    10
+#define SENSOR_AVG        3
+uint16_t sensorBuf[SENSOR_AVG] = {0};
+uint8_t  sensorIdx    = 0;
+uint8_t  sensorFilled = 0;
+uint32_t lastSensorRead = 0;
+float    appliedSpeed = 0.0f; // 0 = nothing applied yet; reset by loadPage() since setTable() restores 1x
+
+float sensorToSpeed(uint16_t v) {
+  if (v >= SENSOR_THRESHOLD) return SPEED_MIN;
+  if (v <= SENSOR_CLOSE) return SPEED_MAX;
+  float t = (float)(SENSOR_THRESHOLD - v) / (float)(SENSOR_THRESHOLD - SENSOR_CLOSE);
+  return SPEED_MIN + t * (SPEED_MAX - SPEED_MIN);
+}
+
 // --- Pages (see docs/circuit.md) ---
 // Only one page's worth of samples (3 files) lives in RAM at a time -
 // buttonWav[i] gets reloaded from SD, in place, every time the page
@@ -191,6 +226,7 @@ void loadPage(uint8_t p) {
     buttonChannels[i] = buttonWav[i].getChannels();
     buttonSamp[i].setTable(buttonWav[i].getBuffer(), buttonWav[i].getFrameCount(),
                             buttonWav[i].getSampleRate(), buttonChannels[i]);
+    appliedSpeed = 0.0f; // setTable() reset this voice to 1x - reapply the sensor's speed
     DBG("Page %u button %u: loaded '%s' - %u ch, %lu Hz, %lu frames (~%lu ms)\n",
         p + 1, i + 1, buttonWav[i].getFilename(), buttonChannels[i],
         (unsigned long)buttonWav[i].getSampleRate(), buttonWav[i].getFrameCount(),
@@ -247,6 +283,7 @@ void setup() {
 #endif
   }
 
+  analogSetPinAttenuation(SENSOR_PIN, ADC_11db); // full ~0-3.1 V range for the sensor
   pinMode(MODE_BUTTON_PIN, INPUT_PULLUP);
   modeBounce.attach(MODE_BUTTON_PIN, INPUT_PULLUP);
   modeBounce.interval(BUTTON_DEBOUNCE_MS);
@@ -263,6 +300,28 @@ void setup() {
 }
 
 void loop() {
+  // --- Distance sensor -> speed of all voices ---
+  uint32_t nowMs = millis();
+  if (nowMs - lastSensorRead >= SENSOR_READ_MS) {
+    lastSensorRead = nowMs;
+    sensorBuf[sensorIdx] = analogRead(SENSOR_PIN);
+    sensorIdx = (sensorIdx + 1) % SENSOR_AVG;
+    if (sensorFilled < SENSOR_AVG) sensorFilled++;
+    uint32_t sum = 0;
+    for (uint8_t k = 0; k < sensorFilled; k++) sum += sensorBuf[k];
+    uint16_t sensorAvg = sum / sensorFilled;
+    float speed = sensorToSpeed(sensorAvg);
+    if (fabsf(speed - appliedSpeed) > 0.005f) { // skip tiny changes - setSpeed() takes a lock
+      appliedSpeed = speed;
+      for (uint8_t i = 0; i < BUTTON_COUNT; i++) buttonSamp[i].setSpeed(speed);
+      static uint32_t lastSpeedLog = 0;
+      if (nowMs - lastSpeedLog >= 250) { // rate-limited, the sensor changes constantly
+        lastSpeedLog = nowMs;
+        DBG("Sensor %u -> speed %.2fx\n", sensorAvg, speed);
+      }
+    }
+  }
+
   for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
     buttonBounce[i].update();
     if (piezoSampling[i]) {
