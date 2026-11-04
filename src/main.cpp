@@ -80,18 +80,14 @@ SdFs sd;
 
 // --- The 3 buttons (see docs/circuit.md) ---
 // One leg on the GPIO (internal pull-up, pressed = LOW), the other leg on a
-// real GND pin on the dev kit. Each fires on the raw pin reading,
-// immediately, without waiting for debounce to settle. Bounce2 (10ms
-// interval) runs alongside purely to confirm a clean release before the
-// button is armed again - that's what prevents it from re-firing every loop
-// while held down, without adding any latency to the initial press.
+// real GND pin on the dev kit. Debounced with Bounce2; each press triggers
+// on its fell() edge, so it fires exactly once per press.
 #define BUTTON_COUNT 3
-#define BUTTON_DEBOUNCE_MS 10
+#define BUTTON_DEBOUNCE_MS 10 // shared by the 3 buttons and the mode button
 const uint8_t   buttonPins[BUTTON_COUNT]  = {4, 5, 6};
 Bounce          buttonBounce[BUTTON_COUNT];
 Samp            buttonSamp[BUTTON_COUNT];
 uint8_t         buttonChannels[BUTTON_COUNT] = {1, 1, 1};
-bool            buttonArmed[BUTTON_COUNT]    = {true, true, true};
 
 // --- Pages (see docs/circuit.md) ---
 // Only one page's worth of samples (3 files) lives in RAM at a time -
@@ -229,25 +225,20 @@ void loop() {
   }
 
   for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
-    buttonBounce[i].update(); // must run every loop for Bounce2's own interval tracking to stay accurate
-    if (buttonArmed[i]) {
-      if (digitalRead(buttonPins[i]) == LOW) { // raw, immediate - fires before/without waiting for debounce
+    buttonBounce[i].update();
+    if (buttonBounce[i].fell()) { // debounced press edge (HIGH -> LOW), fires once per press
 #if USE_SD_SAMPLER
-        if (buttonLoaded[i]) {
-          DBG("Button %u: pressed (GPIO%d, page %u)\n", i + 1, buttonPins[i], page + 1);
-          buttonSamp[i].start();
-        } else {
-          DBG("Button %u: pressed (GPIO%d, page %u) - no sample loaded for this slot\n",
-              i + 1, buttonPins[i], page + 1);
-        }
-#else
-        DBG("Button %u: pressed (GPIO%d)\n", i + 1, buttonPins[i]);
+      if (buttonLoaded[i]) {
+        DBG("Button %u: pressed (GPIO%d, page %u)\n", i + 1, buttonPins[i], page + 1);
         buttonSamp[i].start();
-#endif
-        buttonArmed[i] = false; // locked out until a debounced release is confirmed below
+      } else {
+        DBG("Button %u: pressed (GPIO%d, page %u) - no sample loaded for this slot\n",
+            i + 1, buttonPins[i], page + 1);
       }
-    } else if (buttonBounce[i].read() == HIGH) {
-      buttonArmed[i] = true; // debounce confirms a clean release - safe to fire again
+#else
+      DBG("Button %u: pressed (GPIO%d)\n", i + 1, buttonPins[i]);
+      buttonSamp[i].start();
+#endif
     }
   }
 
